@@ -3,10 +3,28 @@ import type { SDKMessage } from "./claude.js";
 
 const MAX_LEN = 1900;
 const EDIT_INTERVAL_MS = 1500;
+const DIVIDER = "\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n";
+
+const TOOL_ICONS: Record<string, string> = {
+  Bash: "\uD83D\uDCBB",    // laptop
+  Read: "\uD83D\uDCC4",    // page
+  Edit: "\u270F\uFE0F",     // pencil
+  Write: "\uD83D\uDCDD",   // memo
+  Grep: "\uD83D\uDD0D",    // magnifier
+  Glob: "\uD83D\uDCC2",    // folder
+  Agent: "\uD83E\uDD16",   // robot
+};
 
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return text.slice(0, max) + "\n...(truncated)";
+}
+
+function cleanText(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]+$/gm, "");
 }
 
 function formatToolInput(name: string, input: any): string {
@@ -27,6 +45,8 @@ export class DiscordOutput {
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private safetyTimer: ReturnType<typeof setTimeout> | null = null;
   private finished = false;
+  private lastBlockType = "";
+  private thinkingActive = false;
 
   constructor(channel: TextChannel) {
     this.channel = channel;
@@ -43,7 +63,8 @@ export class DiscordOutput {
     switch (msg.type) {
       case "system": {
         if (msg.subtype === "init") {
-          this.append(`*Session: \`${msg.session_id}\` | Model: \`${msg.model}\`*\n`);
+          const sid = msg.session_id?.slice(0, 8) ?? "?";
+          this.append(`\uD83D\uDD17 **Session** \`${sid}...\`  |  **Model** \`${msg.model}\`\n`);
         }
         break;
       }
@@ -51,10 +72,12 @@ export class DiscordOutput {
         const content = msg.message?.content;
         if (!Array.isArray(content)) break;
         for (const block of content) {
-          // text and thinking are handled by stream_event for real-time output
           if (block.type === "tool_use" && "name" in block) {
-            const input = formatToolInput(block.name, block.input);
-            this.append(`\`Tool: ${block.name}\`\n\`\`\`\n${truncate(input, 800)}\n\`\`\`\n`);
+            this.closeThinking();
+            const icon = TOOL_ICONS[block.name] ?? "\uD83D\uDD27";
+            const input = cleanText(formatToolInput(block.name, block.input));
+            this.appendSection("tool");
+            this.append(`${icon} **${block.name}**\n\`\`\`\n${truncate(input, 800)}\n\`\`\`\n`);
           }
         }
         break;
@@ -64,40 +87,71 @@ export class DiscordOutput {
         if (!Array.isArray(content)) break;
         for (const block of content) {
           if (block.type === "tool_result") {
-            const text = typeof block.content === "string"
+            const raw = typeof block.content === "string"
               ? block.content
               : Array.isArray(block.content)
                 ? block.content.map((c: any) => c.text ?? JSON.stringify(c)).join("\n")
                 : JSON.stringify(block.content);
-            const prefix = block.is_error ? "Error" : "Result";
-            this.append(`*${prefix}:*\n\`\`\`\n${truncate(text, 800)}\n\`\`\`\n`);
+            const text = cleanText(raw);
+            if (block.is_error) {
+              this.append(`\u274C *Error:*\n\`\`\`\n${truncate(text, 800)}\n\`\`\`\n`);
+            } else {
+              this.append(`\u2705 *Result:*\n\`\`\`\n${truncate(text, 800)}\n\`\`\`\n`);
+            }
           }
         }
         break;
       }
       case "result": {
+        this.closeThinking();
         const cost = msg.total_cost_usd != null ? `$${msg.total_cost_usd.toFixed(4)}` : "?";
         const dur = msg.duration_ms != null ? `${(msg.duration_ms / 1000).toFixed(1)}s` : "?";
         const turns = msg.num_turns ?? "?";
         if (msg.is_error && "errors" in msg && msg.errors?.length) {
-          this.append(`**Error:** ${msg.errors.join(", ")}\n`);
+          this.append(`\n\u274C **Error:** ${msg.errors.join(", ")}\n`);
         }
-        this.append(`\n*${cost} | ${dur} | ${turns} turn(s)*\n`);
+        this.append(`${DIVIDER}\uD83D\uDCCA  ${cost}  \u2502  ${dur}  \u2502  ${turns} turn(s)\n`);
         break;
       }
-      // Silently ignore other message types (status, etc.)
       default:
         if ((msg as any).type === "stream_event") {
           const event = (msg as any).event;
           if (event?.type === "content_block_delta") {
             if (event.delta?.type === "text_delta" && event.delta.text) {
+              this.closeThinking();
+              if (this.lastBlockType !== "text") {
+                this.appendSection("text");
+              }
+              this.lastBlockType = "text";
               this.append(event.delta.text);
             } else if (event.delta?.type === "thinking_delta" && event.delta.thinking) {
-              this.append(`> *${event.delta.thinking}*`);
+              if (!this.thinkingActive) {
+                this.appendSection("thinking");
+                this.append("\uD83D\uDCA1 *Thinking...*\n> ");
+                this.thinkingActive = true;
+              }
+              const lines = event.delta.thinking.split("\n");
+              this.append(lines.join("\n> "));
             }
           }
         }
         break;
+    }
+  }
+
+  /** Insert a visual break when switching between block types */
+  private appendSection(type: string) {
+    if (this.lastBlockType && this.lastBlockType !== type) {
+      this.append("\n");
+    }
+    this.lastBlockType = type;
+  }
+
+  /** Close an active thinking block with a trailing newline */
+  private closeThinking() {
+    if (this.thinkingActive) {
+      this.append("\n\n");
+      this.thinkingActive = false;
     }
   }
 
