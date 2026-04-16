@@ -1,8 +1,10 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
-const SESSIONS_FILE = join(process.cwd(), "sessions.json");
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SESSIONS_FILE = join(__dirname, "..", "sessions.json");
 
 export interface ChannelSession {
   sessionId: string;
@@ -103,7 +105,9 @@ class SessionStore {
 
   private save() {
     const data: SessionData = { sessions: Object.fromEntries(this.sessions) };
-    writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    const tmp = SESSIONS_FILE + ".tmp";
+    writeFileSync(tmp, JSON.stringify(data, null, 2));
+    renameSync(tmp, SESSIONS_FILE);
   }
 }
 

@@ -1,14 +1,37 @@
 import { Client, GatewayIntentBits, Events, type Message, type TextChannel } from "discord.js";
-import { execSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { config } from "./config.js";
 import { sessionStore } from "./session.js";
-import { runClaude } from "./claude.js";
+import { runClaude, type ClaudeProcess } from "./claude.js";
 import { DiscordOutput } from "./discord-output.js";
 
-const activeChannels = new Set<string>();
-const onboarding = new Map<string, "awaiting_dir">();
+const execFileAsync = promisify(execFile);
+
+interface ActiveRun {
+  process: ClaudeProcess;
+  channelId: string;
+}
+
+const activeRuns = new Map<string, ActiveRun>();
+const onboarding = new Map<string, { state: "awaiting_dir"; startedAt: number }>();
+
+const DANGEROUS_PATTERNS = [
+  /rm\s+(-\w+\s+)*\//,
+  /mkfs/,
+  /dd\s+.*of=\/dev/,
+  />\s*\/dev\/sd/,
+  /:\(\)\{\s*:\|:&\s*\};:/,
+];
+
+export function shutdownAllRuns() {
+  for (const [, run] of activeRuns) {
+    run.process.abort();
+  }
+  activeRuns.clear();
+}
 
 function getWorkingDir(channelId: string): string {
   const session = sessionStore.get(channelId);
@@ -35,7 +58,13 @@ export function createBot(): Client {
     const channel = message.channel as TextChannel;
 
     // --- onboarding flow ---
-    if (onboarding.get(channel.id) === "awaiting_dir") {
+    const ob = onboarding.get(channel.id);
+    if (ob?.state === "awaiting_dir") {
+      if (Date.now() - ob.startedAt > 10 * 60 * 1000) {
+        onboarding.delete(channel.id);
+        await channel.send("Onboarding timed out. Send a message to start again.");
+        return;
+      }
       const dir = resolve(content);
       if (!existsSync(dir) || !statSync(dir).isDirectory()) {
         await channel.send(`\`${dir}\` is not a valid directory. Try again:`);
@@ -73,17 +102,59 @@ export function createBot(): Client {
 
       // all other shell commands — execute directly
       const cwd = getWorkingDir(channel.id);
+      console.log(`[shell] user=${message.author.id} channel=${channel.id} cmd=${cmd}`);
+
+      if (DANGEROUS_PATTERNS.some(p => p.test(cmd))) {
+        await channel.send("Command blocked -- matches a dangerous pattern.");
+        return;
+      }
+
       try {
-        const out = execSync(cmd, { cwd, timeout: 30000, encoding: "utf-8", maxBuffer: 1024 * 1024 });
-        const text = out.trim();
-        if (text) {
-          await channel.send(`\`\`\`\n${text.slice(0, 1900)}\n\`\`\``);
+        const { stdout, stderr } = await execFileAsync("sh", ["-c", cmd], {
+          cwd,
+          timeout: config.shellTimeout,
+          maxBuffer: 1024 * 1024,
+          encoding: "utf-8",
+        });
+        const text = stdout.trim();
+        const errOut = stderr.trim();
+        const combined = [text, errOut].filter(Boolean).join("\n");
+        if (combined) {
+          await channel.send(`\`\`\`\n${combined.slice(0, 1900)}\n\`\`\``);
         } else {
           await channel.send("*(no output)*");
         }
       } catch (err: any) {
-        const stderr = err.stderr?.trim() || err.message;
-        await channel.send(`\`\`\`\n${stderr.slice(0, 1900)}\n\`\`\``);
+        const errText = err.stderr?.trim() || err.message;
+        await channel.send(`\`\`\`\n${errText.slice(0, 1900)}\n\`\`\``);
+      }
+      return;
+    }
+
+    // --- cc CLI subcommands ---
+    if (content.startsWith("cc ")) {
+      const args = content.slice(3).trim();
+      if (!args) return;
+
+      const cwd = getWorkingDir(channel.id);
+      console.log(`[cc] user=${message.author.id} channel=${channel.id} args=${args}`);
+
+      try {
+        const { stdout, stderr } = await execFileAsync("sh", ["-c", "claude " + args], {
+          cwd,
+          timeout: config.shellTimeout,
+          maxBuffer: 1024 * 1024,
+          encoding: "utf-8",
+        });
+        const combined = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+        if (combined) {
+          await channel.send(`\`\`\`\n${combined.slice(0, 1900)}\n\`\`\``);
+        } else {
+          await channel.send("*(no output)*");
+        }
+      } catch (err: any) {
+        const errText = [err.stdout?.trim(), err.stderr?.trim() || err.message].filter(Boolean).join("\n");
+        await channel.send(`\`\`\`\n${errText.slice(0, 1900)}\n\`\`\``);
       }
       return;
     }
@@ -116,6 +187,18 @@ export function createBot(): Client {
         return;
       }
 
+      // /abort — interrupt running Claude process
+      if (cmd === "abort") {
+        const run = activeRuns.get(channel.id);
+        if (run) {
+          await run.process.interrupt();
+          await channel.send("Interrupting current request...");
+        } else {
+          await channel.send("Nothing running in this channel.");
+        }
+        return;
+      }
+
       // all other / commands — forward to CC as prompt
       await sendToClaude(channel, content);
       return;
@@ -124,7 +207,7 @@ export function createBot(): Client {
     // --- first message: onboarding ---
     if (sessionStore.isNew(channel.id)) {
       sessionStore.startSetup(channel.id);
-      onboarding.set(channel.id, "awaiting_dir");
+      onboarding.set(channel.id, { state: "awaiting_dir", startedAt: Date.now() });
       await channel.send(
         `Welcome! Before we start, please enter the working directory path.\n` +
         `Use \`!ls\` to browse, or type the full path directly:`
@@ -132,7 +215,14 @@ export function createBot(): Client {
       return;
     }
 
-    // --- plain text: CC prompt ---
+    // --- plain text: CC prompt or follow-up ---
+    if (activeRuns.has(channel.id)) {
+      const run = activeRuns.get(channel.id)!;
+      run.process.sendFollowUp(content);
+      await channel.send("*(message forwarded to running session)*");
+      return;
+    }
+
     await sendToClaude(channel, content);
   });
 
@@ -143,41 +233,62 @@ export function createBot(): Client {
       return;
     }
 
-    if (activeChannels.has(channel.id)) {
-      await channel.send("Still working on the previous request...");
+    if (activeRuns.has(channel.id)) {
+      const run = activeRuns.get(channel.id)!;
+      run.process.sendFollowUp(prompt);
+      await channel.send("*(message forwarded to running session)*");
       return;
     }
 
-    activeChannels.add(channel.id);
+    if (activeRuns.size >= config.maxConcurrentClaude) {
+      await channel.send(`Global limit reached (${config.maxConcurrentClaude} concurrent). Please wait or \`/abort\` another channel.`);
+      return;
+    }
+
     const output = new DiscordOutput(channel);
 
     try {
-      const emitter = runClaude(prompt, {
+      const proc = runClaude(prompt, {
         sessionId: session.sessionId,
         isNew: !session.used,
         workingDir: session.workingDir,
       });
 
+      activeRuns.set(channel.id, { process: proc, channelId: channel.id });
       sessionStore.markUsed(channel.id);
 
-      emitter.on("event", (event) => {
-        output.handleEvent(event);
+      proc.on("message", (msg) => {
+        try {
+          output.handleMessage(msg);
+        } catch (err) {
+          console.error("Error handling Claude message:", err);
+        }
       });
 
       await new Promise<void>((resolve) => {
-        emitter.on("done", resolve);
+        proc.on("done", resolve);
       });
     } catch (err: any) {
       await channel.send(`**Error:** ${err.message}`);
     } finally {
       await output.finish();
-      activeChannels.delete(channel.id);
+      activeRuns.delete(channel.id);
     }
   }
 
   client.once(Events.ClientReady, (c) => {
     console.log(`Bot ready as ${c.user.tag}`);
   });
+
+  // Periodic cleanup of expired onboarding entries
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, ob] of onboarding) {
+      if (now - ob.startedAt > 10 * 60 * 1000) {
+        onboarding.delete(id);
+      }
+    }
+  }, 60 * 1000);
 
   return client;
 }

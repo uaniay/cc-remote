@@ -5,6 +5,8 @@ interface Config {
   allowedUserIds: string[];
   ccWorkingDir: string;
   ccModel?: string;
+  maxConcurrentClaude: number;
+  shellTimeout: number;
 }
 
 function loadConfig(): Config {
@@ -21,6 +23,8 @@ function loadConfig(): Config {
     allowedUserIds,
     ccWorkingDir,
     ccModel: process.env.CC_MODEL || undefined,
+    maxConcurrentClaude: parseInt(process.env.MAX_CONCURRENT_CLAUDE || "3", 10),
+    shellTimeout: parseInt(process.env.SHELL_TIMEOUT || "30000", 10),
   };
 }
 

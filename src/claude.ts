@@ -1,141 +1,151 @@
-import { spawn, ChildProcess } from "node:child_process";
+import { query, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { EventEmitter } from "node:events";
 import { config } from "./config.js";
 
-export interface ClaudeEvent {
-  type: "init" | "thinking" | "text" | "tool_use" | "tool_result" | "result" | "error";
-  data: any;
-}
+export type { SDKMessage, SDKUserMessage, Query };
 
 export interface ClaudeRunOptions {
-  sessionId: string;
+  sessionId?: string;
   isNew: boolean;
   workingDir: string;
 }
 
-const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-
-export function runClaude(prompt: string, opts: ClaudeRunOptions): EventEmitter {
-  const emitter = new EventEmitter();
-
-  const args = [
-    "-p", prompt,
-    "--output-format", "stream-json",
-    "--verbose",
-    "--dangerously-skip-permissions",
-  ];
-
-  if (config.ccModel) args.push("--model", config.ccModel);
-
-  if (opts.isNew) {
-    args.push("--session-id", opts.sessionId);
-  } else {
-    args.push("--resume", opts.sessionId);
-  }
-
-  const proc = spawn("claude", args, {
-    cwd: opts.workingDir,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  const timeout = setTimeout(() => {
-    proc.kill("SIGTERM");
-    emitter.emit("event", { type: "error", data: { message: "Timeout: CC process killed after 5 minutes" } });
-  }, TIMEOUT_MS);
-
-  let buffer = "";
-
-  proc.stdout!.on("data", (chunk: Buffer) => {
-    buffer += chunk.toString();
-    const lines = buffer.split("\n");
-    buffer = lines.pop()!; // keep incomplete last line
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const parsed = JSON.parse(line);
-        const event = parseStreamLine(parsed);
-        if (event) emitter.emit("event", event);
-      } catch {
-        // skip unparseable lines
-      }
-    }
-  });
-
-  let stderr = "";
-  proc.stderr!.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-
-  proc.on("close", (code) => {
-    clearTimeout(timeout);
-    // flush remaining buffer
-    if (buffer.trim()) {
-      try {
-        const parsed = JSON.parse(buffer);
-        const event = parseStreamLine(parsed);
-        if (event) emitter.emit("event", event);
-      } catch { /* ignore */ }
-    }
-    if (code !== 0 && code !== null) {
-      emitter.emit("event", { type: "error", data: { message: `CC exited with code ${code}`, stderr } });
-    }
-    emitter.emit("done");
-  });
-
-  proc.on("error", (err) => {
-    clearTimeout(timeout);
-    emitter.emit("event", { type: "error", data: { message: err.message } });
-    emitter.emit("done");
-  });
-
-  // expose kill for external abort
-  (emitter as any).kill = () => {
-    proc.kill("SIGTERM");
-  };
-
-  return emitter;
+export interface ClaudeProcess extends EventEmitter {
+  interrupt(): Promise<void>;
+  abort(): void;
+  sendFollowUp(text: string): void;
 }
 
-function parseStreamLine(obj: any): ClaudeEvent | null {
-  if (obj.type === "system" && obj.subtype === "init") {
-    return { type: "init", data: { model: obj.model, sessionId: obj.session_id } };
-  }
+const TIMEOUT_MS = 5 * 60 * 1000;
 
-  if (obj.type === "assistant" && obj.message?.content) {
-    for (const block of obj.message.content) {
-      if (block.type === "thinking") {
-        return { type: "thinking", data: { text: block.thinking } };
-      }
-      if (block.type === "text") {
-        return { type: "text", data: { text: block.text } };
-      }
-      if (block.type === "tool_use") {
-        return { type: "tool_use", data: { name: block.name, input: block.input } };
-      }
+class MessageQueue implements AsyncIterable<SDKUserMessage> {
+  private queue: SDKUserMessage[] = [];
+  private waiting: ((result: IteratorResult<SDKUserMessage>) => void) | null = null;
+  private done = false;
+
+  push(msg: SDKUserMessage) {
+    if (this.done) return;
+    if (this.waiting) {
+      const resolve = this.waiting;
+      this.waiting = null;
+      resolve({ value: msg, done: false });
+    } else {
+      this.queue.push(msg);
     }
   }
 
-  if (obj.type === "user" && obj.message?.content) {
-    for (const block of obj.message.content) {
-      if (block.type === "tool_result") {
-        return { type: "tool_result", data: { content: block.content, isError: block.is_error } };
-      }
+  end() {
+    this.done = true;
+    if (this.waiting) {
+      const resolve = this.waiting;
+      this.waiting = null;
+      resolve({ value: undefined as any, done: true });
     }
   }
 
-  if (obj.type === "result") {
+  [Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
     return {
-      type: "result",
-      data: {
-        result: obj.result,
-        cost: obj.total_cost_usd,
-        duration: obj.duration_ms,
-        turns: obj.num_turns,
-        isError: obj.is_error,
+      next: () => {
+        if (this.queue.length > 0) {
+          return Promise.resolve({ value: this.queue.shift()!, done: false as const });
+        }
+        if (this.done) {
+          return Promise.resolve({ value: undefined as any, done: true as const });
+        }
+        return new Promise<IteratorResult<SDKUserMessage>>((resolve) => {
+          this.waiting = resolve;
+        });
       },
     };
   }
+}
 
-  return null;
+export function runClaude(prompt: string, opts: ClaudeRunOptions): ClaudeProcess {
+  const emitter = new EventEmitter() as ClaudeProcess;
+  const followUpQueue = new MessageQueue();
+
+  const options: Parameters<typeof query>[0]["options"] = {
+    cwd: opts.workingDir,
+    permissionMode: "bypassPermissions",
+    tools: { type: "preset", preset: "claude_code" },
+  };
+
+  if (config.ccModel) {
+    options.model = config.ccModel;
+  }
+
+  if (!opts.isNew && opts.sessionId) {
+    options.resume = opts.sessionId;
+  } else if (opts.sessionId) {
+    options.sessionId = opts.sessionId;
+  }
+
+  let q: Query;
+
+  // Start the query loop asynchronously
+  (async () => {
+    try {
+      q = query({ prompt, options });
+
+      // Wire up follow-up messages via streamInput
+      q.streamInput(followUpQueue).catch(() => {
+        // streamInput ends when the query ends or queue is closed
+      });
+
+      const timeout = setTimeout(() => {
+        emitter.emit("message", {
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          errors: ["Timeout: process killed after 5 minutes"],
+          duration_ms: TIMEOUT_MS,
+          duration_api_ms: 0,
+          num_turns: 0,
+          stop_reason: null,
+          total_cost_usd: 0,
+        } as SDKMessage);
+        q.close();
+      }, TIMEOUT_MS);
+
+      for await (const message of q) {
+        emitter.emit("message", message);
+      }
+
+      clearTimeout(timeout);
+    } catch (err: any) {
+      emitter.emit("message", {
+        type: "result",
+        subtype: "error_during_execution",
+        is_error: true,
+        errors: [err.message || String(err)],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 0,
+        stop_reason: null,
+        total_cost_usd: 0,
+      } as SDKMessage);
+    } finally {
+      followUpQueue.end();
+      emitter.emit("done");
+    }
+  })();
+
+  emitter.interrupt = async () => {
+    if (q) await q.interrupt();
+  };
+
+  emitter.abort = () => {
+    if (q) q.close();
+    followUpQueue.end();
+  };
+
+  emitter.sendFollowUp = (text: string) => {
+    followUpQueue.push({
+      type: "user",
+      message: { role: "user", content: text },
+      parent_tool_use_id: null,
+    });
+  };
+
+  return emitter;
 }

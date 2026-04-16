@@ -1,5 +1,5 @@
 import type { TextChannel, Message } from "discord.js";
-import type { ClaudeEvent } from "./claude.js";
+import type { SDKMessage } from "./claude.js";
 
 const MAX_LEN = 1900;
 const EDIT_INTERVAL_MS = 1500;
@@ -25,49 +25,70 @@ export class DiscordOutput {
   private buffer = "";
   private dirty = false;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private safetyTimer: ReturnType<typeof setTimeout> | null = null;
   private finished = false;
 
   constructor(channel: TextChannel) {
     this.channel = channel;
     this.flushTimer = setInterval(() => this.flush(), EDIT_INTERVAL_MS);
+    this.safetyTimer = setTimeout(() => {
+      if (!this.finished) {
+        console.warn("DiscordOutput safety timeout -- auto-finishing");
+        this.finish();
+      }
+    }, 10 * 60 * 1000);
   }
 
-  async handleEvent(event: ClaudeEvent) {
-    switch (event.type) {
-      case "init":
-        this.append(`*Session: \`${event.data.sessionId}\` | Model: \`${event.data.model}\`*\n`);
-        break;
-      case "thinking":
-        if (event.data.text?.trim()) {
-          this.append(`> *${truncate(event.data.text.trim(), 500)}*\n`);
+  handleMessage(msg: SDKMessage) {
+    switch (msg.type) {
+      case "system": {
+        if (msg.subtype === "init") {
+          this.append(`*Session: \`${msg.session_id}\` | Model: \`${msg.model}\`*\n`);
         }
         break;
-      case "tool_use": {
-        const input = formatToolInput(event.data.name, event.data.input);
-        this.append(`\`Tool: ${event.data.name}\`\n\`\`\`\n${truncate(input, 800)}\n\`\`\`\n`);
+      }
+      case "assistant": {
+        const content = msg.message?.content;
+        if (!Array.isArray(content)) break;
+        for (const block of content) {
+          if (block.type === "thinking" && "thinking" in block && block.thinking) {
+            this.append(`> *${truncate(String(block.thinking).trim(), 500)}*\n`);
+          } else if (block.type === "text" && "text" in block) {
+            this.append(block.text + "\n");
+          } else if (block.type === "tool_use" && "name" in block) {
+            const input = formatToolInput(block.name, block.input);
+            this.append(`\`Tool: ${block.name}\`\n\`\`\`\n${truncate(input, 800)}\n\`\`\`\n`);
+          }
+        }
         break;
       }
-      case "tool_result": {
-        const content = typeof event.data.content === "string"
-          ? event.data.content
-          : JSON.stringify(event.data.content);
-        const prefix = event.data.isError ? "Error" : "Result";
-        this.append(`*${prefix}:*\n\`\`\`\n${truncate(content, 800)}\n\`\`\`\n`);
+      case "user": {
+        const content = msg.message?.content;
+        if (!Array.isArray(content)) break;
+        for (const block of content) {
+          if (block.type === "tool_result") {
+            const text = typeof block.content === "string"
+              ? block.content
+              : Array.isArray(block.content)
+                ? block.content.map((c: any) => c.text ?? JSON.stringify(c)).join("\n")
+                : JSON.stringify(block.content);
+            const prefix = block.is_error ? "Error" : "Result";
+            this.append(`*${prefix}:*\n\`\`\`\n${truncate(text, 800)}\n\`\`\`\n`);
+          }
+        }
         break;
       }
-      case "text":
-        this.append(event.data.text + "\n");
-        break;
       case "result": {
-        const cost = event.data.cost != null ? `$${event.data.cost.toFixed(4)}` : "?";
-        const dur = event.data.duration != null ? `${(event.data.duration / 1000).toFixed(1)}s` : "?";
-        const turns = event.data.turns ?? "?";
+        const cost = msg.total_cost_usd != null ? `$${msg.total_cost_usd.toFixed(4)}` : "?";
+        const dur = msg.duration_ms != null ? `${(msg.duration_ms / 1000).toFixed(1)}s` : "?";
+        const turns = msg.num_turns ?? "?";
+        if (msg.is_error && "errors" in msg && msg.errors?.length) {
+          this.append(`**Error:** ${msg.errors.join(", ")}\n`);
+        }
         this.append(`\n*${cost} | ${dur} | ${turns} turn(s)*\n`);
         break;
       }
-      case "error":
-        this.append(`**Error:** ${event.data.message}\n`);
-        break;
+      // Silently ignore other message types (stream_event, status, etc.)
     }
   }
 
@@ -82,36 +103,40 @@ export class DiscordOutput {
 
     try {
       if (!this.currentMsg) {
-        // send first message
         const content = this.buffer.slice(0, MAX_LEN);
         this.currentMsg = await this.channel.send(content);
         if (this.buffer.length > MAX_LEN) {
           this.buffer = this.buffer.slice(MAX_LEN);
           this.dirty = true;
         } else {
-          this.buffer = this.currentMsg.content; // sync with what Discord has
+          this.buffer = this.currentMsg.content;
         }
       } else if (this.buffer.length > MAX_LEN) {
-        // current buffer too long, finalize current message and start new one
         const cutPoint = this.buffer.lastIndexOf("\n", MAX_LEN);
         const splitAt = cutPoint > 0 ? cutPoint : MAX_LEN;
         const forCurrent = this.buffer.slice(0, splitAt);
-        this.buffer = this.buffer.slice(splitAt);
-        this.dirty = true;
+        const remainder = this.buffer.slice(splitAt);
 
         await this.currentMsg.edit(forCurrent);
-        this.currentMsg = await this.channel.send(this.buffer.slice(0, MAX_LEN));
-        if (this.buffer.length > MAX_LEN) {
-          this.buffer = this.buffer.slice(MAX_LEN);
-        } else {
-          this.buffer = this.currentMsg.content;
-        }
+
+        this.buffer = remainder;
+        this.currentMsg = null;
+        this.dirty = true;
       } else {
         await this.currentMsg.edit(this.buffer);
       }
-    } catch (err) {
-      // Discord API error (rate limit, etc) — retry next tick
-      this.dirty = true;
+    } catch (err: any) {
+      if (err?.code === 50035) {
+        this.buffer = truncate(this.buffer, MAX_LEN - 100);
+        this.dirty = true;
+      } else if (err?.status === 429) {
+        const retryAfter = err.retryAfter ?? 2000;
+        this.dirty = true;
+        await new Promise(r => setTimeout(r, retryAfter));
+      } else {
+        console.error("Discord flush error:", err?.message ?? err);
+        this.dirty = true;
+      }
     }
   }
 
@@ -119,6 +144,7 @@ export class DiscordOutput {
     if (this.finished) return;
     this.finished = true;
     if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.safetyTimer) clearTimeout(this.safetyTimer);
     await this.flush();
   }
 }
