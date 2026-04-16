@@ -51,11 +51,8 @@ export class DiscordOutput {
         const content = msg.message?.content;
         if (!Array.isArray(content)) break;
         for (const block of content) {
-          if (block.type === "thinking" && "thinking" in block && block.thinking) {
-            this.append(`> *${truncate(String(block.thinking).trim(), 500)}*\n`);
-          } else if (block.type === "text" && "text" in block) {
-            this.append(block.text + "\n");
-          } else if (block.type === "tool_use" && "name" in block) {
+          // text and thinking are handled by stream_event for real-time output
+          if (block.type === "tool_use" && "name" in block) {
             const input = formatToolInput(block.name, block.input);
             this.append(`\`Tool: ${block.name}\`\n\`\`\`\n${truncate(input, 800)}\n\`\`\`\n`);
           }
@@ -88,7 +85,19 @@ export class DiscordOutput {
         this.append(`\n*${cost} | ${dur} | ${turns} turn(s)*\n`);
         break;
       }
-      // Silently ignore other message types (stream_event, status, etc.)
+      // Silently ignore other message types (status, etc.)
+      default:
+        if ((msg as any).type === "stream_event") {
+          const event = (msg as any).event;
+          if (event?.type === "content_block_delta") {
+            if (event.delta?.type === "text_delta" && event.delta.text) {
+              this.append(event.delta.text);
+            } else if (event.delta?.type === "thinking_delta" && event.delta.thinking) {
+              this.append(`> *${event.delta.thinking}*`);
+            }
+          }
+        }
+        break;
     }
   }
 

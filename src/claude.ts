@@ -68,6 +68,7 @@ export function runClaude(prompt: string, opts: ClaudeRunOptions): ClaudeProcess
     cwd: opts.workingDir,
     permissionMode: "bypassPermissions",
     tools: { type: "preset", preset: "claude_code" },
+    includePartialMessages: true,
   };
 
   if (config.ccModel) {
