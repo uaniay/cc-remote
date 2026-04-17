@@ -321,26 +321,38 @@ export function createBot(): Client {
   }
 
   client.on(Events.InteractionCreate, async (interaction) => {
-    if (!interaction.isButton()) return;
-    if (!interaction.customId.startsWith("detail:")) return;
+    // Handle button clicks
+    if (interaction.isButton()) {
+      if (!interaction.customId.startsWith("detail:")) return;
 
-    const detailId = interaction.customId.slice("detail:".length);
-    const content = getDetail(detailId);
+      const detailId = interaction.customId.slice("detail:".length);
+      const content = getDetail(detailId);
 
-    if (!content) {
-      await interaction.reply({ content: "Detail expired or not found.", ephemeral: true });
+      if (!content) {
+        await interaction.reply({ content: "Detail expired or not found.", ephemeral: true });
+        return;
+      }
+
+      if (content.length <= 2000) {
+        await interaction.reply({ content, ephemeral: true });
+      } else {
+        await interaction.reply({ content: content.slice(0, 2000), ephemeral: true });
+        for (let i = 2000; i < content.length; i += 2000) {
+          await interaction.followUp({ content: content.slice(i, i + 2000), ephemeral: true });
+        }
+      }
       return;
     }
 
-    // Discord ephemeral messages have 2000 char limit
-    if (content.length <= 2000) {
-      await interaction.reply({ content, ephemeral: true });
-    } else {
-      // Send first chunk as reply, follow up with rest
-      await interaction.reply({ content: content.slice(0, 2000), ephemeral: true });
-      for (let i = 2000; i < content.length; i += 2000) {
-        await interaction.followUp({ content: content.slice(i, i + 2000), ephemeral: true });
+    // Catch-all for unregistered slash commands to prevent "did not respond" error
+    if (interaction.isCommand() || interaction.isAutocomplete()) {
+      if (interaction.isCommand()) {
+        await interaction.reply({
+          content: "This bot uses text commands, not slash commands. Type your command as a regular message (e.g. `/resume`).",
+          ephemeral: true,
+        });
       }
+      return;
     }
   });
 
