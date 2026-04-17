@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { config } from "./config.js";
 import { sessionStore } from "./session.js";
 import { runClaude, type ClaudeProcess } from "./claude.js";
-import { DiscordOutput } from "./discord-output.js";
+import { DiscordOutput, getDetail } from "./discord-output.js";
 import { listSessions, formatSessionList, type HistoryEntry } from "./history.js";
 
 const execFileAsync = promisify(execFile);
@@ -319,6 +319,30 @@ export function createBot(): Client {
       activeRuns.delete(channel.id);
     }
   }
+
+  client.on(Events.InteractionCreate, async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (!interaction.customId.startsWith("detail:")) return;
+
+    const detailId = interaction.customId.slice("detail:".length);
+    const content = getDetail(detailId);
+
+    if (!content) {
+      await interaction.reply({ content: "Detail expired or not found.", ephemeral: true });
+      return;
+    }
+
+    // Discord ephemeral messages have 2000 char limit
+    if (content.length <= 2000) {
+      await interaction.reply({ content, ephemeral: true });
+    } else {
+      // Send first chunk as reply, follow up with rest
+      await interaction.reply({ content: content.slice(0, 2000), ephemeral: true });
+      for (let i = 2000; i < content.length; i += 2000) {
+        await interaction.followUp({ content: content.slice(i, i + 2000), ephemeral: true });
+      }
+    }
+  });
 
   client.once(Events.ClientReady, (c) => {
     console.log(`Bot ready as ${c.user.tag}`);
