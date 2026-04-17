@@ -52,6 +52,30 @@ npm run dev          # development (tsx)
 npm run build && npm start  # production
 ```
 
+4. Deploy as background service (pm2):
+
+```bash
+npm install -g pm2
+npm run build
+pm2 start dist/index.js --name cc-remote --cwd /home/uania/repos/cc-remote
+pm2 startup && pm2 save   # auto-start on boot
+```
+
+pm2 commands:
+
+```bash
+pm2 logs cc-remote       # view logs
+pm2 restart cc-remote    # restart
+pm2 stop cc-remote       # stop
+pm2 status               # check status
+```
+
+After code changes:
+
+```bash
+npm run build && pm2 restart cc-remote
+```
+
 ## Commands
 
 ### Slash Commands
