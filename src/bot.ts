@@ -7,7 +7,7 @@ import { config } from "./config.js";
 import { sessionStore } from "./session.js";
 import { runClaude, type ClaudeProcess } from "./claude.js";
 import { DiscordOutput, getDetail } from "./discord-output.js";
-import { listSessions, formatSessionList, type HistoryEntry } from "./history.js";
+import { listSessions, formatSessionList } from "./history.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -204,7 +204,7 @@ export function createBot(): Client {
       if (cmd === "resume") {
         const arg = content.slice("/resume".length).trim();
         const cwd = getWorkingDir(channel.id);
-        const sessions = listSessions(cwd);
+        const sessions = await listSessions(cwd);
 
         if (!arg) {
           // list available sessions
@@ -238,7 +238,7 @@ export function createBot(): Client {
         }
 
         const sid = picked.sessionId.slice(0, 8);
-        const display = picked.display.length > 50 ? picked.display.slice(0, 47) + "..." : picked.display;
+        const display = (picked.summary || picked.firstPrompt || "untitled").slice(0, 50);
         await channel.send(`Session restored: \`${sid}...\`\n> ${display}`);
         return;
       }
