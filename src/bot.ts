@@ -7,6 +7,7 @@ import { config } from "./config.js";
 import { sessionStore } from "./session.js";
 import { runClaude, type ClaudeProcess } from "./claude.js";
 import { DiscordOutput } from "./discord-output.js";
+import { listSessions, formatSessionList, type HistoryEntry } from "./history.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -196,6 +197,49 @@ export function createBot(): Client {
         } else {
           await channel.send("Nothing running in this channel.");
         }
+        return;
+      }
+
+      // /resume [n] — list or restore a historical session
+      if (cmd === "resume") {
+        const arg = content.slice("/resume".length).trim();
+        const cwd = getWorkingDir(channel.id);
+        const sessions = listSessions(cwd);
+
+        if (!arg) {
+          // list available sessions
+          if (!sessions.length) {
+            await channel.send(`No sessions found for \`${cwd}\`.`);
+            return;
+          }
+          await channel.send(
+            `**Sessions in** \`${cwd}\`:\n\n` +
+            formatSessionList(sessions) +
+            `\n\nUse \`/resume <number>\` to restore.`
+          );
+          return;
+        }
+
+        // pick by number
+        const idx = parseInt(arg, 10);
+        if (isNaN(idx) || idx < 1 || idx > sessions.length) {
+          await channel.send(`Invalid choice. Pick a number between 1 and ${sessions.length}.`);
+          return;
+        }
+
+        const picked = sessions[idx - 1];
+        const session = sessionStore.get(channel.id);
+        if (session?.ready) {
+          sessionStore.resumeSession(channel.id, picked.sessionId);
+        } else {
+          sessionStore.finishSetup(channel.id, cwd);
+          sessionStore.resumeSession(channel.id, picked.sessionId);
+          onboarding.delete(channel.id);
+        }
+
+        const sid = picked.sessionId.slice(0, 8);
+        const display = picked.display.length > 50 ? picked.display.slice(0, 47) + "..." : picked.display;
+        await channel.send(`Session restored: \`${sid}...\`\n> ${display}`);
         return;
       }
 

@@ -76,6 +76,16 @@ class SessionStore {
     }
   }
 
+  /** Resume a specific session by ID, keeping the current workingDir */
+  resumeSession(channelId: string, sessionId: string): void {
+    const existing = this.sessions.get(channelId);
+    if (existing) {
+      existing.sessionId = sessionId;
+      existing.used = true;
+      this.save();
+    }
+  }
+
   reset(channelId: string): boolean {
     const deleted = this.sessions.delete(channelId);
     if (deleted) this.save();
