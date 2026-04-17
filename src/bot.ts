@@ -21,6 +21,7 @@ interface ActiveRun {
 }
 
 const activeRuns = new Map<string, ActiveRun>();
+const channelModes = new Map<string, string>();
 const onboarding = new Map<string, { state: "awaiting_dir"; startedAt: number }>();
 
 const DANGEROUS_PATTERNS = [
@@ -218,6 +219,7 @@ export function createBot(): Client {
         sessionId: session.sessionId,
         isNew: !session.used,
         workingDir: session.workingDir,
+        permissionMode: channelModes.get(channel.id),
       });
 
       activeRuns.set(channel.id, { process: proc, channelId: channel.id });
@@ -348,6 +350,20 @@ export function createBot(): Client {
         await interaction.editReply(`Session restored: \`${sid}...\`\n> ${display}`);
         return;
       }
+
+      if (interaction.commandName === "mode") {
+        const mode = interaction.options.getString("mode", true);
+        const run = activeRuns.get(channel.id);
+        if (run) {
+          await run.process.setPermissionMode(mode);
+          channelModes.set(channel.id, mode);
+          await interaction.reply(`Permission mode switched to **${mode}** (active session).`);
+        } else {
+          channelModes.set(channel.id, mode);
+          await interaction.reply(`Permission mode set to **${mode}** (applies to next request).`);
+        }
+        return;
+      }
     } catch (err: any) {
       console.error("Slash command error:", err.message);
       try {
@@ -372,6 +388,19 @@ export function createBot(): Client {
         .setDescription("List or restore a historical session")
         .addIntegerOption(opt =>
           opt.setName("number").setDescription("Session number to restore").setRequired(false)
+        ),
+      new SlashCommandBuilder()
+        .setName("mode")
+        .setDescription("Switch Claude permission mode")
+        .addStringOption(opt =>
+          opt.setName("mode").setDescription("Permission mode").setRequired(true)
+            .addChoices(
+              { name: "plan", value: "plan" },
+              { name: "acceptEdits", value: "acceptEdits" },
+              { name: "auto", value: "auto" },
+              { name: "default", value: "default" },
+              { name: "bypassPermissions", value: "bypassPermissions" },
+            )
         ),
     ].map(c => c.toJSON());
 

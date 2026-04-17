@@ -8,12 +8,14 @@ export interface ClaudeRunOptions {
   sessionId?: string;
   isNew: boolean;
   workingDir: string;
+  permissionMode?: string;
 }
 
 export interface ClaudeProcess extends EventEmitter {
   interrupt(): Promise<void>;
   abort(): void;
   sendFollowUp(text: string): void;
+  setPermissionMode(mode: string): Promise<void>;
 }
 
 const TIMEOUT_MS = 5 * 60 * 1000;
@@ -66,7 +68,7 @@ export function runClaude(prompt: string, opts: ClaudeRunOptions): ClaudeProcess
 
   const options: Parameters<typeof query>[0]["options"] = {
     cwd: opts.workingDir,
-    permissionMode: "bypassPermissions",
+    permissionMode: (opts.permissionMode ?? "bypassPermissions") as any,
     tools: { type: "preset", preset: "claude_code" },
     includePartialMessages: true,
   };
@@ -146,6 +148,10 @@ export function runClaude(prompt: string, opts: ClaudeRunOptions): ClaudeProcess
       message: { role: "user", content: text },
       parent_tool_use_id: null,
     });
+  };
+
+  emitter.setPermissionMode = async (mode: string) => {
+    if (q) await q.setPermissionMode(mode as any);
   };
 
   return emitter;
