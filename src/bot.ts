@@ -1,4 +1,8 @@
-import { Client, GatewayIntentBits, Events, type Message, type TextChannel } from "discord.js";
+import {
+  Client, GatewayIntentBits, Events, REST, Routes,
+  SlashCommandBuilder,
+  type Message, type TextChannel, type ChatInputCommandInteraction,
+} from "discord.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, statSync } from "node:fs";
@@ -160,90 +164,8 @@ export function createBot(): Client {
       return;
     }
 
-    // --- / CC slash commands ---
+    // --- / commands — forward to CC as prompt ---
     if (content.startsWith("/")) {
-      const cmd = content.slice(1).split(/\s/)[0];
-
-      // /clear — bot intercepts, resets session
-      if (cmd === "clear") {
-        const had = sessionStore.reset(channel.id);
-        onboarding.delete(channel.id);
-        await channel.send(had ? "Session cleared." : "No active session.");
-        return;
-      }
-
-      // /status — bot intercepts, shows session info
-      if (cmd === "status") {
-        const session = sessionStore.get(channel.id);
-        if (session?.ready) {
-          await channel.send(
-            `Session: \`${session.sessionId.slice(0, 8)}...\`\n` +
-            `Directory: \`${session.workingDir}\`\n` +
-            `Model: \`${config.ccModel || "default"}\`\n` +
-            `Used: ${session.used ? "yes" : "no"}`
-          );
-        } else {
-          await channel.send("No active session. Send a message to start.");
-        }
-        return;
-      }
-
-      // /abort — interrupt running Claude process
-      if (cmd === "abort") {
-        const run = activeRuns.get(channel.id);
-        if (run) {
-          await run.process.interrupt();
-          await channel.send("Interrupting current request...");
-        } else {
-          await channel.send("Nothing running in this channel.");
-        }
-        return;
-      }
-
-      // /resume [n] — list or restore a historical session
-      if (cmd === "resume") {
-        const arg = content.slice("/resume".length).trim();
-        const cwd = getWorkingDir(channel.id);
-        const sessions = await listSessions(cwd);
-
-        if (!arg) {
-          // list available sessions
-          if (!sessions.length) {
-            await channel.send(`No sessions found for \`${cwd}\`.`);
-            return;
-          }
-          await channel.send(
-            `**Sessions in** \`${cwd}\`:\n\n` +
-            formatSessionList(sessions) +
-            `\n\nUse \`/resume <number>\` to restore.`
-          );
-          return;
-        }
-
-        // pick by number
-        const idx = parseInt(arg, 10);
-        if (isNaN(idx) || idx < 1 || idx > sessions.length) {
-          await channel.send(`Invalid choice. Pick a number between 1 and ${sessions.length}.`);
-          return;
-        }
-
-        const picked = sessions[idx - 1];
-        const session = sessionStore.get(channel.id);
-        if (session?.ready) {
-          sessionStore.resumeSession(channel.id, picked.sessionId);
-        } else {
-          sessionStore.finishSetup(channel.id, cwd);
-          sessionStore.resumeSession(channel.id, picked.sessionId);
-          onboarding.delete(channel.id);
-        }
-
-        const sid = picked.sessionId.slice(0, 8);
-        const display = (picked.summary || picked.firstPrompt || "untitled").slice(0, 50);
-        await channel.send(`Session restored: \`${sid}...\`\n> ${display}`);
-        return;
-      }
-
-      // all other / commands — forward to CC as prompt
       await sendToClaude(channel, content);
       return;
     }
@@ -344,20 +266,110 @@ export function createBot(): Client {
       return;
     }
 
-    // Catch-all for unregistered slash commands to prevent "did not respond" error
-    if (interaction.isCommand() || interaction.isAutocomplete()) {
-      if (interaction.isCommand()) {
-        await interaction.reply({
-          content: "This bot uses text commands, not slash commands. Type your command as a regular message (e.g. `/resume`).",
-          ephemeral: true,
-        });
+    // Handle slash commands
+    if (!interaction.isChatInputCommand()) return;
+    if (!config.allowedUserIds.includes(interaction.user.id)) {
+      await interaction.reply({ content: "You are not authorized.", ephemeral: true });
+      return;
+    }
+
+    const channel = interaction.channel as TextChannel;
+
+    if (interaction.commandName === "clear") {
+      const had = sessionStore.reset(channel.id);
+      onboarding.delete(channel.id);
+      await interaction.reply(had ? "Session cleared." : "No active session.");
+      return;
+    }
+
+    if (interaction.commandName === "status") {
+      const session = sessionStore.get(channel.id);
+      if (session?.ready) {
+        await interaction.reply(
+          `Session: \`${session.sessionId.slice(0, 8)}...\`\n` +
+          `Directory: \`${session.workingDir}\`\n` +
+          `Model: \`${config.ccModel || "default"}\`\n` +
+          `Used: ${session.used ? "yes" : "no"}`
+        );
+      } else {
+        await interaction.reply("No active session. Send a message to start.");
       }
+      return;
+    }
+
+    if (interaction.commandName === "abort") {
+      const run = activeRuns.get(channel.id);
+      if (run) {
+        await run.process.interrupt();
+        await interaction.reply("Interrupting current request...");
+      } else {
+        await interaction.reply("Nothing running in this channel.");
+      }
+      return;
+    }
+
+    if (interaction.commandName === "resume") {
+      const num = interaction.options.getInteger("number");
+      const cwd = getWorkingDir(channel.id);
+      const sessions = await listSessions(cwd);
+
+      if (num === null) {
+        if (!sessions.length) {
+          await interaction.reply(`No sessions found for \`${cwd}\`.`);
+          return;
+        }
+        await interaction.reply(
+          `**Sessions in** \`${cwd}\`:\n\n` +
+          formatSessionList(sessions) +
+          `\n\nUse \`/resume number:<n>\` to restore.`
+        );
+        return;
+      }
+
+      if (num < 1 || num > sessions.length) {
+        await interaction.reply(`Invalid choice. Pick a number between 1 and ${sessions.length}.`);
+        return;
+      }
+
+      const picked = sessions[num - 1];
+      const session = sessionStore.get(channel.id);
+      if (session?.ready) {
+        sessionStore.resumeSession(channel.id, picked.sessionId);
+      } else {
+        sessionStore.finishSetup(channel.id, cwd);
+        sessionStore.resumeSession(channel.id, picked.sessionId);
+        onboarding.delete(channel.id);
+      }
+
+      const sid = picked.sessionId.slice(0, 8);
+      const display = (picked.summary || picked.firstPrompt || "untitled").slice(0, 50);
+      await interaction.reply(`Session restored: \`${sid}...\`\n> ${display}`);
       return;
     }
   });
 
-  client.once(Events.ClientReady, (c) => {
+  client.once(Events.ClientReady, async (c) => {
     console.log(`Bot ready as ${c.user.tag}`);
+
+    const commands = [
+      new SlashCommandBuilder().setName("clear").setDescription("Reset the current session"),
+      new SlashCommandBuilder().setName("status").setDescription("Show current session info"),
+      new SlashCommandBuilder().setName("abort").setDescription("Interrupt the running Claude process"),
+      new SlashCommandBuilder()
+        .setName("resume")
+        .setDescription("List or restore a historical session")
+        .addIntegerOption(opt =>
+          opt.setName("number").setDescription("Session number to restore").setRequired(false)
+        ),
+    ].map(c => c.toJSON());
+
+    const rest = new REST({ version: "10" }).setToken(config.discordToken);
+    try {
+      await rest.put(Routes.applicationCommands(c.user.id), { body: commands });
+      console.log("Slash commands registered.");
+    } catch (err) {
+      console.error("Failed to register slash commands:", err);
+    }
   });
 
   // Periodic cleanup of expired onboarding entries
