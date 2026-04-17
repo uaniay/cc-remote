@@ -251,16 +251,16 @@ export function createBot(): Client {
       const content = getDetail(detailId);
 
       if (!content) {
-        await interaction.reply({ content: "Detail expired or not found.", ephemeral: true });
+        await interaction.reply({ content: "Detail expired or not found.", flags: ["Ephemeral"] });
         return;
       }
 
       if (content.length <= 2000) {
-        await interaction.reply({ content, ephemeral: true });
+        await interaction.reply({ content, flags: ["Ephemeral"] });
       } else {
-        await interaction.reply({ content: content.slice(0, 2000), ephemeral: true });
+        await interaction.reply({ content: content.slice(0, 2000), flags: ["Ephemeral"] });
         for (let i = 2000; i < content.length; i += 2000) {
-          await interaction.followUp({ content: content.slice(i, i + 2000), ephemeral: true });
+          await interaction.followUp({ content: content.slice(i, i + 2000), flags: ["Ephemeral"] });
         }
       }
       return;
@@ -269,82 +269,94 @@ export function createBot(): Client {
     // Handle slash commands
     if (!interaction.isChatInputCommand()) return;
     if (!config.allowedUserIds.includes(interaction.user.id)) {
-      await interaction.reply({ content: "You are not authorized.", ephemeral: true });
+      await interaction.reply({ content: "You are not authorized.", flags: ["Ephemeral"] });
       return;
     }
 
     const channel = interaction.channel as TextChannel;
 
-    if (interaction.commandName === "clear") {
-      const had = sessionStore.reset(channel.id);
-      onboarding.delete(channel.id);
-      await interaction.reply(had ? "Session cleared." : "No active session.");
-      return;
-    }
-
-    if (interaction.commandName === "status") {
-      const session = sessionStore.get(channel.id);
-      if (session?.ready) {
-        await interaction.reply(
-          `Session: \`${session.sessionId.slice(0, 8)}...\`\n` +
-          `Directory: \`${session.workingDir}\`\n` +
-          `Model: \`${config.ccModel || "default"}\`\n` +
-          `Used: ${session.used ? "yes" : "no"}`
-        );
-      } else {
-        await interaction.reply("No active session. Send a message to start.");
+    try {
+      if (interaction.commandName === "clear") {
+        const had = sessionStore.reset(channel.id);
+        onboarding.delete(channel.id);
+        await interaction.reply(had ? "Session cleared." : "No active session.");
+        return;
       }
-      return;
-    }
 
-    if (interaction.commandName === "abort") {
-      const run = activeRuns.get(channel.id);
-      if (run) {
-        await run.process.interrupt();
-        await interaction.reply("Interrupting current request...");
-      } else {
-        await interaction.reply("Nothing running in this channel.");
+      if (interaction.commandName === "status") {
+        const session = sessionStore.get(channel.id);
+        if (session?.ready) {
+          await interaction.reply(
+            `Session: \`${session.sessionId.slice(0, 8)}...\`\n` +
+            `Directory: \`${session.workingDir}\`\n` +
+            `Model: \`${config.ccModel || "default"}\`\n` +
+            `Used: ${session.used ? "yes" : "no"}`
+          );
+        } else {
+          await interaction.reply("No active session. Send a message to start.");
+        }
+        return;
       }
-      return;
-    }
 
-    if (interaction.commandName === "resume") {
-      const num = interaction.options.getInteger("number");
-      const cwd = getWorkingDir(channel.id);
-      const sessions = await listSessions(cwd);
+      if (interaction.commandName === "abort") {
+        const run = activeRuns.get(channel.id);
+        if (run) {
+          await run.process.interrupt();
+          await interaction.reply("Interrupting current request...");
+        } else {
+          await interaction.reply("Nothing running in this channel.");
+        }
+        return;
+      }
 
-      if (num === null) {
-        if (!sessions.length) {
-          await interaction.reply(`No sessions found for \`${cwd}\`.`);
+      if (interaction.commandName === "resume") {
+        await interaction.deferReply();
+        const num = interaction.options.getInteger("number");
+        const cwd = getWorkingDir(channel.id);
+        const sessions = await listSessions(cwd);
+
+        if (num === null) {
+          if (!sessions.length) {
+            await interaction.editReply(`No sessions found for \`${cwd}\`.`);
+            return;
+          }
+          await interaction.editReply(
+            `**Sessions in** \`${cwd}\`:\n\n` +
+            formatSessionList(sessions) +
+            `\n\nUse \`/resume number:<n>\` to restore.`
+          );
           return;
         }
-        await interaction.reply(
-          `**Sessions in** \`${cwd}\`:\n\n` +
-          formatSessionList(sessions) +
-          `\n\nUse \`/resume number:<n>\` to restore.`
-        );
+
+        if (num < 1 || num > sessions.length) {
+          await interaction.editReply(`Invalid choice. Pick a number between 1 and ${sessions.length}.`);
+          return;
+        }
+
+        const picked = sessions[num - 1];
+        const session = sessionStore.get(channel.id);
+        if (session?.ready) {
+          sessionStore.resumeSession(channel.id, picked.sessionId);
+        } else {
+          sessionStore.finishSetup(channel.id, cwd);
+          sessionStore.resumeSession(channel.id, picked.sessionId);
+          onboarding.delete(channel.id);
+        }
+
+        const sid = picked.sessionId.slice(0, 8);
+        const display = (picked.summary || picked.firstPrompt || "untitled").slice(0, 50);
+        await interaction.editReply(`Session restored: \`${sid}...\`\n> ${display}`);
         return;
       }
-
-      if (num < 1 || num > sessions.length) {
-        await interaction.reply(`Invalid choice. Pick a number between 1 and ${sessions.length}.`);
-        return;
-      }
-
-      const picked = sessions[num - 1];
-      const session = sessionStore.get(channel.id);
-      if (session?.ready) {
-        sessionStore.resumeSession(channel.id, picked.sessionId);
-      } else {
-        sessionStore.finishSetup(channel.id, cwd);
-        sessionStore.resumeSession(channel.id, picked.sessionId);
-        onboarding.delete(channel.id);
-      }
-
-      const sid = picked.sessionId.slice(0, 8);
-      const display = (picked.summary || picked.firstPrompt || "untitled").slice(0, 50);
-      await interaction.reply(`Session restored: \`${sid}...\`\n> ${display}`);
-      return;
+    } catch (err: any) {
+      console.error("Slash command error:", err.message);
+      try {
+        if (interaction.deferred) {
+          await interaction.editReply(`Error: ${err.message}`);
+        } else if (!interaction.replied) {
+          await interaction.reply({ content: `Error: ${err.message}`, flags: ["Ephemeral"] });
+        }
+      } catch { /* interaction already expired */ }
     }
   });
 
