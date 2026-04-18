@@ -70,10 +70,10 @@ pm2 stop cc-remote       # stop
 pm2 status               # check status
 ```
 
-After code changes:
+Update and restart after code changes:
 
 ```bash
-npm run build && pm2 restart cc-remote
+git pull && npm install && npm run build && pm2 restart cc-remote
 ```
 
 ## Commands
