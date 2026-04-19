@@ -6,60 +6,58 @@ import { randomUUID } from "node:crypto";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SESSIONS_FILE = join(__dirname, "..", "sessions.json");
 
-export interface ChannelSession {
+export interface ConversationSession {
   sessionId: string;
   workingDir: string;
-  ready: boolean; // false = still in onboarding
-  used: boolean;  // true after first CC call (--session-id → --resume)
+  ready: boolean;
+  used: boolean;
 }
 
 interface SessionData {
-  sessions: Record<string, ChannelSession>;
+  sessions: Record<string, ConversationSession>;
 }
 
 class SessionStore {
-  private sessions: Map<string, ChannelSession> = new Map();
+  private sessions: Map<string, ConversationSession> = new Map();
 
   constructor() {
     this.load();
   }
 
-  get(channelId: string): ChannelSession | undefined {
-    return this.sessions.get(channelId);
+  get(conversationId: string): ConversationSession | undefined {
+    return this.sessions.get(conversationId);
   }
 
-  create(channelId: string, workingDir: string): ChannelSession {
-    const session: ChannelSession = {
+  create(conversationId: string, workingDir: string): ConversationSession {
+    const session: ConversationSession = {
       sessionId: randomUUID(),
       workingDir,
       ready: true,
       used: false,
     };
-    this.sessions.set(channelId, session);
+    this.sessions.set(conversationId, session);
     this.save();
     return session;
   }
 
-  /** Start onboarding — create a session that isn't ready yet */
-  startSetup(channelId: string): void {
-    this.sessions.set(channelId, { sessionId: "", workingDir: "", ready: false, used: false });
+  startSetup(conversationId: string): void {
+    this.sessions.set(conversationId, { sessionId: "", workingDir: "", ready: false, used: false });
   }
 
-  /** Finish onboarding — assign dir and generate session ID */
-  finishSetup(channelId: string, workingDir: string): ChannelSession {
-    const session: ChannelSession = {
+  finishSetup(conversationId: string, workingDir: string): ConversationSession {
+    const session: ConversationSession = {
       sessionId: randomUUID(),
       workingDir,
       ready: true,
       used: false,
     };
-    this.sessions.set(channelId, session);
+    this.sessions.set(conversationId, session);
     this.save();
     return session;
   }
 
-  setWorkingDir(channelId: string, dir: string): void {
-    const existing = this.sessions.get(channelId);
+  setWorkingDir(conversationId: string, dir: string): void {
+    const existing = this.sessions.get(conversationId);
     if (existing) {
       existing.workingDir = dir;
       existing.sessionId = randomUUID();
@@ -68,17 +66,16 @@ class SessionStore {
     }
   }
 
-  markUsed(channelId: string): void {
-    const existing = this.sessions.get(channelId);
+  markUsed(conversationId: string): void {
+    const existing = this.sessions.get(conversationId);
     if (existing && !existing.used) {
       existing.used = true;
       this.save();
     }
   }
 
-  /** Resume a specific session by ID, keeping the current workingDir */
-  resumeSession(channelId: string, sessionId: string): void {
-    const existing = this.sessions.get(channelId);
+  resumeSession(conversationId: string, sessionId: string): void {
+    const existing = this.sessions.get(conversationId);
     if (existing) {
       existing.sessionId = sessionId;
       existing.used = true;
@@ -86,18 +83,18 @@ class SessionStore {
     }
   }
 
-  reset(channelId: string): boolean {
-    const deleted = this.sessions.delete(channelId);
+  reset(conversationId: string): boolean {
+    const deleted = this.sessions.delete(conversationId);
     if (deleted) this.save();
     return deleted;
   }
 
-  list(): Map<string, ChannelSession> {
+  list(): Map<string, ConversationSession> {
     return new Map(this.sessions);
   }
 
-  isNew(channelId: string): boolean {
-    const s = this.sessions.get(channelId);
+  isNew(conversationId: string): boolean {
+    const s = this.sessions.get(conversationId);
     return !s || !s.ready;
   }
 

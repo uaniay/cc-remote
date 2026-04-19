@@ -1,79 +1,14 @@
-import type { TextChannel, Message } from "discord.js";
-import { ButtonBuilder, ButtonStyle, ActionRowBuilder } from "discord.js";
-import { randomUUID } from "node:crypto";
-import type { SDKMessage } from "./claude.js";
-
-const MAX_LEN = 1900;
-const EDIT_INTERVAL_MS = 1500;
-const DIVIDER = "\n────────────────────\n";
-const DETAIL_TTL_MS = 30 * 60 * 1000;
-
-const TOOL_ICONS: Record<string, string> = {
-  Bash: "💻",
-  Read: "📄",
-  Edit: "✏️",
-  Write: "📝",
-  Grep: "🔍",
-  Glob: "📂",
-  Agent: "🤖",
-};
-
-// Global detail store with TTL cleanup
-const detailStore = new Map<string, { content: string; createdAt: number }>();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, entry] of detailStore) {
-    if (now - entry.createdAt > DETAIL_TTL_MS) {
-      detailStore.delete(id);
-    }
-  }
-}, 60 * 1000);
-
-export function getDetail(id: string): string | undefined {
-  return detailStore.get(id)?.content;
-}
-
-function storeDetail(content: string): string {
-  const id = randomUUID().slice(0, 8);
-  detailStore.set(id, { content, createdAt: Date.now() });
-  return id;
-}
-
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return text.slice(0, max) + "\n...(truncated)";
-}
-
-function cleanText(text: string): string {
-  return text
-    .replace(/\r\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \t]+$/gm, "");
-}
-
-function formatToolInput(name: string, input: any): string {
-  if (name === "Bash" && input?.command) return input.command;
-  if (name === "Read" && input?.file_path) return input.file_path;
-  if (name === "Edit" && input?.file_path) return `${input.file_path}\n- ${truncate(input.old_string ?? "", 100)}\n+ ${truncate(input.new_string ?? "", 100)}`;
-  if (name === "Write" && input?.file_path) return input.file_path;
-  if (name === "Grep" && input?.pattern) return `grep "${input.pattern}" ${input.path || "."}`;
-  if (name === "Glob" && input?.pattern) return input.pattern;
-  return JSON.stringify(input, null, 2);
-}
-
-function toolSummary(name: string, input: any): string {
-  if (name === "Bash" && input?.command) {
-    const cmd = input.command.split("\n")[0];
-    return cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
-  }
-  if (name === "Read" && input?.file_path) return input.file_path;
-  if (name === "Edit" && input?.file_path) return input.file_path;
-  if (name === "Write" && input?.file_path) return input.file_path;
-  if (name === "Grep" && input?.pattern) return `"${input.pattern}"`;
-  if (name === "Glob" && input?.pattern) return input.pattern;
-  return name;
-}
+import {
+  Client, GatewayIntentBits, Events, REST, Routes,
+  SlashCommandBuilder, ButtonBuilder, ButtonStyle, ActionRowBuilder,
+  type Message, type TextChannel,
+} from "discord.js";
+import type { BotAdapter, IncomingMessage, OutputHandler } from "../types.js";
+import type { SDKMessage } from "../claude.js";
+import {
+  MAX_LEN, EDIT_INTERVAL_MS, DIVIDER, TOOL_ICONS,
+  getDetail, storeDetail, truncate, cleanText, formatToolInput, toolSummary,
+} from "../output-utils.js";
 
 function buildButtonRows(buttons: { id: string; label: string }[]): ActionRowBuilder<ButtonBuilder>[] {
   const rows: ActionRowBuilder<ButtonBuilder>[] = [];
@@ -94,7 +29,7 @@ function buildButtonRows(buttons: { id: string; label: string }[]): ActionRowBui
   return rows;
 }
 
-export class DiscordOutput {
+class DiscordOutput implements OutputHandler {
   private channel: TextChannel;
   private currentMsg: Message | null = null;
   private buffer = "";
@@ -243,7 +178,6 @@ export class DiscordOutput {
         const forCurrent = this.buffer.slice(0, splitAt);
         const remainder = this.buffer.slice(splitAt);
 
-        // Finalize current message with buttons
         const rows = buildButtonRows(this.pendingButtons);
         this.pendingButtons = [];
         if (rows.length > 0) {
@@ -281,7 +215,6 @@ export class DiscordOutput {
 
     this.closeThinking();
 
-    // Final flush with buttons
     if (this.dirty || this.buffer) {
       this.dirty = false;
       try {
@@ -303,7 +236,6 @@ export class DiscordOutput {
         console.error("Discord finish error:", err?.message ?? err);
       }
     } else if (this.pendingButtons.length > 0 && this.currentMsg) {
-      // No new content but have buttons to attach
       try {
         const rows = buildButtonRows(this.pendingButtons);
         this.pendingButtons = [];
@@ -315,5 +247,155 @@ export class DiscordOutput {
         console.error("Discord button attach error:", err?.message ?? err);
       }
     }
+  }
+}
+
+export class DiscordAdapter implements BotAdapter {
+  readonly platform = "discord";
+  private client: Client;
+  private token: string;
+  private onCommand?: (conversationId: string, userId: string, command: string, args?: Record<string, any>) => Promise<string>;
+
+  constructor(token: string) {
+    this.token = token;
+    this.client = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessages,
+      ],
+    });
+  }
+
+  async sendText(conversationId: string, text: string): Promise<void> {
+    const channelId = conversationId.replace("discord:", "");
+    const channel = this.client.channels.cache.get(channelId) as TextChannel | undefined;
+    if (channel) await channel.send(text);
+  }
+
+  createOutput(conversationId: string): OutputHandler {
+    const channelId = conversationId.replace("discord:", "");
+    const channel = this.client.channels.cache.get(channelId) as TextChannel;
+    return new DiscordOutput(channel);
+  }
+
+  async start(
+    onMessage: (msg: IncomingMessage) => Promise<void>,
+    onCommand?: (conversationId: string, userId: string, command: string, args?: Record<string, any>) => Promise<string>,
+  ): Promise<void> {
+    this.onCommand = onCommand;
+
+    this.client.on(Events.MessageCreate, async (message: Message) => {
+      if (message.author.bot) return;
+      const text = message.content.trim();
+      if (!text) return;
+
+      await onMessage({
+        platform: "discord",
+        conversationId: "discord:" + message.channel.id,
+        userId: message.author.id,
+        text,
+      });
+    });
+
+    this.client.on(Events.InteractionCreate, async (interaction) => {
+      // Handle button clicks
+      if (interaction.isButton()) {
+        if (!interaction.customId.startsWith("detail:")) return;
+
+        const detailId = interaction.customId.slice("detail:".length);
+        const content = getDetail(detailId);
+
+        if (!content) {
+          await interaction.reply({ content: "Detail expired or not found.", flags: ["Ephemeral"] });
+          return;
+        }
+
+        if (content.length <= 2000) {
+          await interaction.reply({ content, flags: ["Ephemeral"] });
+        } else {
+          await interaction.reply({ content: content.slice(0, 2000), flags: ["Ephemeral"] });
+          for (let i = 2000; i < content.length; i += 2000) {
+            await interaction.followUp({ content: content.slice(i, i + 2000), flags: ["Ephemeral"] });
+          }
+        }
+        return;
+      }
+
+      // Handle slash commands
+      if (!interaction.isChatInputCommand() || !this.onCommand) return;
+
+      const conversationId = "discord:" + interaction.channel!.id;
+      const userId = interaction.user.id;
+
+      try {
+        if (interaction.commandName === "resume") {
+          await interaction.deferReply();
+          const num = interaction.options.getInteger("number");
+          const reply = await this.onCommand(conversationId, userId, "resume", { number: num });
+          await interaction.editReply(reply);
+        } else if (interaction.commandName === "mode") {
+          const mode = interaction.options.getString("mode", true);
+          const reply = await this.onCommand(conversationId, userId, "mode", { mode });
+          await interaction.reply(reply);
+        } else {
+          const reply = await this.onCommand(conversationId, userId, interaction.commandName);
+          await interaction.reply(reply);
+        }
+      } catch (err: any) {
+        console.error("Slash command error:", err.message);
+        try {
+          if (interaction.deferred) {
+            await interaction.editReply(`Error: ${err.message}`);
+          } else if (!interaction.replied) {
+            await interaction.reply({ content: `Error: ${err.message}`, flags: ["Ephemeral"] });
+          }
+        } catch { /* interaction already expired */ }
+      }
+    });
+
+    this.client.once(Events.ClientReady, async (c) => {
+      console.log(`Bot ready as ${c.user.tag}`);
+
+      const commands = [
+        new SlashCommandBuilder().setName("clear").setDescription("Reset the current session"),
+        new SlashCommandBuilder().setName("status").setDescription("Show current session info"),
+        new SlashCommandBuilder().setName("abort").setDescription("Interrupt the running Claude process"),
+        new SlashCommandBuilder()
+          .setName("resume")
+          .setDescription("List or restore a historical session")
+          .addIntegerOption(opt =>
+            opt.setName("number").setDescription("Session number to restore").setRequired(false)
+          ),
+        new SlashCommandBuilder()
+          .setName("mode")
+          .setDescription("Switch Claude permission mode")
+          .addStringOption(opt =>
+            opt.setName("mode").setDescription("Permission mode").setRequired(true)
+              .addChoices(
+                { name: "plan", value: "plan" },
+                { name: "acceptEdits", value: "acceptEdits" },
+                { name: "auto", value: "auto" },
+                { name: "default", value: "default" },
+                { name: "bypassPermissions", value: "bypassPermissions" },
+              )
+          ),
+      ].map(c => c.toJSON());
+
+      const rest = new REST({ version: "10" }).setToken(this.token);
+      try {
+        await rest.put(Routes.applicationCommands(c.user.id), { body: commands });
+        console.log("Slash commands registered.");
+      } catch (err) {
+        console.error("Failed to register slash commands:", err);
+      }
+    });
+
+    await this.client.login(this.token);
+  }
+
+  async stop(): Promise<void> {
+    this.client.destroy();
   }
 }
